@@ -1,7 +1,6 @@
 import os
-from random import shuffle
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import torch
 torch.manual_seed(44)
@@ -9,10 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from dataset import Dataset_ESD, collate_fn
+from dataset_ESD import Dataset_ESD, collate_fn
 from torch.utils.data import DataLoader
 
-from VC_model import VoiceConversionModel
+from module.vc_model import VoiceConversionModel
 
 import wandb
 import time
@@ -28,29 +27,31 @@ class Train():
         self.device = "cuda" if torch.cuda.is_available() else 'cpu'
         self.wandb_login = config['Train']['wandb_login']
 
+
         """ HyperParameters """
         self.batch_size = config['Train']['batch_size']
         self.lr = config['Train']['learning_rate']
-        self.weight_decay = config['Train']['weight_decay']
         self.num_workers = config['Train']['num_workers']
+        weight_decay = config['Train']['weight_decay']
 
         self.lambda_spk = config['Train']['lambda_spk']
-        self.lambda_vq = config['Train']['lambda_vq']
-
-        step_size = config['Train']['scheduler_size']
-        gamma = config['Train']['scheduler_gamma']
+        self.lambda_quant = config['Train']['lambda_quant']
+        self.beta = config['Train']['beta_KL']
 
         stats_file = "../ESD_preprocessed/mel_stats.npy"
         self.mel_stats = np.load(stats_file).astype(np.float64)
+        
+        step_size = config['Train']['stepLR_size']
+        gamma = config['Train']['stepLR_gamma']
+
 
         """ Model, Optimizer """
         self.model = VoiceConversionModel(config).to(self.device)
 
         print("Autoencoder: {}".format(self.get_n_params(self.model)))
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=weight_decay)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=step_size, gamma=gamma)
-
 
 
         """ Dataset """
@@ -81,7 +82,9 @@ class Train():
         )
 
         self.cur_step = 0
-        self.outer_pbar = tqdm(total=tot_epoch, desc=f"Training... >>>> Total {tot_epoch} Epochs", position=0)
+        self.outer_pbar = tqdm(total=tot_epoch, 
+                               desc=f"Training... >>>> Total {tot_epoch} Epochs", 
+                               position=0)
 
         ts = time.time()
         self.asset_path = self.dir_path + str(ts)
@@ -98,25 +101,26 @@ class Train():
         mel, spk_id, emo_id = list(map(lambda x: x.to(self.device), batch))
         
         # forward
-        recon_mel, post_mel, vq_loss, spk_loss, _, _, _ = self.model(mel, spk_id, emo_id)
+        recon_mel, quant_loss, kl_pitch_loss, kl_spk_loss, cls_spk_loss = self.model(mel, spk_id, emo_id)
 
         # calculate loss
         mel_loss = self.spec_loss(mel, recon_mel)
-        post_loss = self.spec_loss(mel, post_mel)
         
-        tot_loss = mel_loss + post_loss + vq_loss * self.lambda_vq + spk_loss * self.lambda_spk
+        tot_loss = mel_loss + quant_loss * self.lambda_quant + cls_spk_loss * self.lambda_spk + (kl_pitch_loss + kl_spk_loss) * self.beta
 
-        return tot_loss, mel_loss, post_loss, vq_loss, spk_loss
+        return tot_loss, mel_loss, quant_loss, kl_pitch_loss, kl_spk_loss, cls_spk_loss
 
 
     def training_step(self):
+        self.model.train()
+
         for batch in tqdm(self.train_loader):
             """ Training step """
             # zero grad
             self.optimizer.zero_grad()
             
             # forward & calculate total loss
-            tot_loss, mel_loss, post_loss, vq_loss, spk_loss = self.step(batch)
+            tot_loss, mel_loss, quant_loss, kl_pitch_loss, kl_spk_loss, cls_spk_loss = self.step(batch)
 
             # backwarding
             tot_loss.backward()
@@ -128,12 +132,15 @@ class Train():
 
             """ end """
             loss_dict = {
-                "Total Loss": tot_loss.item(), "Mel Loss": mel_loss.item(), "Post Loss": post_loss.item(),
-                "VQ Loss": vq_loss.item(), "SPK Loss": spk_loss.item()
+                "Total Loss": tot_loss.item(), 
+                "Mel Loss": mel_loss.item(), 
+                "VQ Loss": quant_loss.item(),
+                "KL P Loss": kl_pitch_loss.item(), 
+                "KL S Loss": kl_spk_loss.item(),
+                "Cls Loss": cls_spk_loss.item(),
             }
             
-            self.training_step_end(loss_dict)
-            
+            self.training_step_end(loss_dict)      
 
     def training_step_end(self, loss_dict):
         self.cur_step += 1
@@ -155,30 +162,30 @@ class Train():
             torch.save(save_dict, save_path)
             print("save model at step {} ...".format(self.cur_step))
 
-
     def step_eval(self, batch):
+        self.model.eval()
+        
         mel, spk_id, emo_id = list(map(lambda x: x.to(self.device), batch))
         with torch.no_grad():
-            _, pred_mel, vq_loss, spk_loss, _, _, _ = self.model(mel, spk_id, emo_id)
+            pred_mel, vq_loss, cls_loss = self.model.inference(mel, spk_id, emo_id)
             
             # calculate loss
             mel_loss = self.spec_loss(mel, pred_mel)
             
-        return pred_mel, mel_loss, vq_loss, spk_loss
-
+        return pred_mel, mel_loss, vq_loss, cls_loss
 
     def validation_step(self):
         with torch.no_grad():
             eval_pbar = tqdm(self.eval_loader, desc="Validation...")
 
             for batch in eval_pbar:
-                recon_mel, mel_loss, vq_loss, spk_loss = self.step_eval(batch)
+                recon_mel, mel_loss, vq_loss, cls_loss = self.step_eval(batch)
 
                 """ log """
                 loss_dict = {
                     "Post Val Loss": mel_loss.item(),
-                    "Spk Val Loss": spk_loss.item(),
                     "Q Val Loss": vq_loss.item(),
+                    "Cls Val Loss": cls_loss.item(),
                 }
 
                 eval_pbar.set_postfix(loss_dict)
@@ -186,9 +193,9 @@ class Train():
         if self.wandb_login:
             wandb.log(loss_dict)
 
-        check_recon_mel(self.denormalize(recon_mel[0].to('cpu').detach().numpy(), *self.mel_stats).T, 
+        check_recon_mel(self.denormalize(recon_mel[-1].to('cpu').detach().numpy(), *self.mel_stats).T, 
             self.asset_path, self.outer_pbar.n, mode='recon')
-        check_recon_mel(self.denormalize(batch[0][0].to('cpu').detach().numpy(), *self.mel_stats).T, 
+        check_recon_mel(self.denormalize(batch[0][-1].to('cpu').detach().numpy(), *self.mel_stats).T, 
             self.asset_path, self.outer_pbar.n, mode='GT')
 
         with open(self.asset_path + "/config.yaml", 'w') as file:
@@ -196,7 +203,6 @@ class Train():
 
         self.outer_pbar.update()
         eval_pbar.close()
-
 
     def spec_loss(self, mel, pred_mel):
         return F.l1_loss(mel, pred_mel)
@@ -216,15 +222,12 @@ class Train():
 
         
 
-    
-
-
 import argparse
 def argument_parse():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--epochs', type=int, 
-        default=400
+        default=800
     )
     parser.add_argument('--gpu_visible_devices', type=str, default='0, 1, 2, 3, 4, 5')
 
@@ -234,10 +237,11 @@ def argument_parse():
 
 
 
+
 if __name__ == "__main__":
     import yaml
     config = yaml.load(
-        open("../configs/config_VC.yaml", "r"), Loader=yaml.FullLoader
+        open("./config/config.yaml", "r"), Loader=yaml.FullLoader
     )
 
     wandb_login = config['Train']['wandb_login']

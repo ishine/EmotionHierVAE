@@ -1,0 +1,60 @@
+Preprocess:
+  n_fft: 1024
+  n_hop: 256
+  n_mel: 80
+
+  sr: 16000 # Hz
+
+Dataset:
+  name: "ESD"
+  num_speakers: 10
+  num_emotions: 5
+
+Loader:
+  mel_length: 96
+
+Model:
+  n_codebook: 64       # Dictionary size of quantized vectors
+
+  d_encoder_hidden: 256
+  d_decoder_hidden: 256
+
+  d_quantizer_hidden: 128
+  d_speaker_hidden: 32
+  d_emotion_hidden: 32
+  d_pitch_hidden: 16
+
+  n_EncVCBlock: 4
+  n_DecVCBlock: 4
+
+  kernel_size_encoder: 5
+  kernel_size_decoder: 5
+  dropout_encoder: 0.1
+  dropout_decoder: 0.1
+
+Train:
+  wandb_login: False
+
+  save_model_path: "./save_model/"
+  save_for_step: 10000
+
+  epoch: 100
+  batch_size: 64
+  num_workers: 12
+  learning_rate: 5.e-4    # best: 5.e-4 / 1.e-3 256
+  weight_decay: 1.e-6
+
+  stepLR_size: 5000
+  stepLR_gamma: 0.9
+
+  lambda_spk: 0.
+  lambda_quant: 1.
+  beta_KL: 10
+
+  metric_type: "Euclidean"
+  metric_temperature: 0.3
+
+Result:
+  asset_dir_path: "./assets/220320/"
+  tsne_save_name: "tsne_speaker.jpg"
+  reconMel_save_name: "recon_mel.jpg"

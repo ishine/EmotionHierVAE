@@ -24,7 +24,7 @@ def check_recon_mel(recon_mel, pth_SaveMel, number, mode='GT'):
     """
     fig, ax = plt.subplots()
     img = display.specshow(20 * recon_mel, x_axis='time',
-                            y_axis='mel', sr=22050,
+                            y_axis='mel', sr=16000,
                             ax=ax, vmax=0, vmin=-100, cmap='magma')
     fig.colorbar(img, ax=ax, format='%+2.0f dB')
     ax.set(title='Mel-frequency spectrogram')    

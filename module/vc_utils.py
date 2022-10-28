@@ -1,20 +1,37 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
+
 from torch.nn.utils import spectral_norm
 
-import math
 
 
 
+""" SoftPlus """
+
+class SoftPlus(nn.Module):
+    def forward(self, input_tensor):
+        return _softplus.apply(input_tensor)
+
+class _softplus(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, i):
+        result=torch.log(1+torch.exp(i))
+        ctx.save_for_backward(i)
+        return result
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output*torch.sigmoid(ctx.saved_variables[0])
+
+
+
+
+""" Adaptive Instance Norm """
 
 class AdaIN(nn.Module):
-    def __init__(self, d_hid, d_cond=None):
+    def __init__(self, d_hid, d_cond):
         super().__init__()
-
-        if d_cond is None:
-            d_cond = 128
 
         self.linear = nn.Linear(d_cond, 2 * d_hid, bias=False)
 
@@ -39,13 +56,58 @@ def feature_norm(x, dim=1, eps: float = 1e-14):
 
 
 
+
+""" Pixel Shuffle """
+
 class PixelShuffle(nn.Module):
+    """ 
+        Upsampling along time-axis + Downsampling along channel-axis.
+    """
+    def __init__(self, scale_factor: int):
+        super(PixelShuffle, self).__init__()
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """ 
+        ? INPUT
+        :x: tensor, (batch_size, channels, width)
+        
+        ? OUTPUT
+        :return: tensor, (batch_size, out_channels, width),
+            Shuffling pixels in the tensor to re-sample to suitable size,
+            - channels = channels // scale_factor
+            - width = width * scale_factor
+        """ 
+        batch_size, channels, in_width = x.size()
+        channels = channels // self.scale_factor
+        out_width = in_width * self.scale_factor
+        
+        x = x.contiguous().view(batch_size, channels, self.scale_factor, in_width)
+        x = x.permute(0, 1, 3, 2).contiguous()
+        x = x.view(batch_size, channels, out_width)
+        return x
+
+
+
+class InversePixelShuffle(nn.Module):
+    """ 
+        Downsampling along time-axis + Upsampling along channel-axis.
+    """
     def __init__(self, scale_factor: int):
         super().__init__()
         self.scale_factor = scale_factor
 
     def forward(self, x):
-        """ Upsampling along time-axis + Downsampling along channel-axis """
+        """ 
+        ? INPUT
+        :x: tensor, (batch_size, in_channels, width)
+        
+        ? OUTPUT
+        :return: tensor, (batch_size, out_channels, width),
+            Shuffling pixels in the tensor to re-sample to suitable size,
+            - out_channels = in_channels * scale_factor
+            - width = width // scale_factor
+        """ 
 
         batch_size, in_channels, width = x.size()
         out_channels = in_channels * self.scale_factor
@@ -57,6 +119,9 @@ class PixelShuffle(nn.Module):
         return x
 
 
+
+
+""" Quantize"""
 
 class Quantizer(nn.Module):
     def __init__(self, n_embeddings, embedding_dim, commitment_cost=0.25, decay=0.999, epsilon=1e-12):
@@ -72,11 +137,7 @@ class Quantizer(nn.Module):
         self.register_buffer("ema_count", torch.zeros(n_embeddings))
         self.register_buffer("ema_weight", self.embedding.clone())
 
-        self.norm = nn.InstanceNorm1d(embedding_dim, affine=False)
-
     def encode(self, x):
-        x = self.norm(x)
-
         M, D = self.embedding.size()
         x_flat = x.detach().reshape(-1, D)
 
@@ -92,6 +153,7 @@ class Quantizer(nn.Module):
 
     def forward(self, x):
         M, D = self.embedding.size()
+        
         x_flat = x.detach().reshape(-1, D)
 
         distances = torch.addmm(torch.sum(self.embedding ** 2, dim=1) +
@@ -126,30 +188,3 @@ class Quantizer(nn.Module):
         return quantized, loss, perplexity
 
 
-
-class PositionalEncoding(nn.Module):
-
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
-        """
-        x = x.contiguous().transpose(0, 1) # (B, T, C) -> (T, B, C)
-        x = x + self.pe[:x.size(0)]
-        return self.dropout(x).contiguous().transpose(0, 1) # (T, B, C) -> (B, T, C)
-
-def src_mask(sz):
-    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
